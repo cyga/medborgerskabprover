@@ -111,6 +111,22 @@ def load_progress():
 def backup_files():
     return [f for f in (PROGRESS_FILE, STATE_FILE) if f.exists()]
 
+def drive_ready():
+    """Смонтирован ли Drive.
+
+    Сервис стартует при загрузке машины, а google-drive-ocamlfuse монтируется
+    только при графическом входе в систему. Без этой проверки mkdir создал бы
+    настоящие каталоги внутри точки монтирования: копия легла бы на локальный
+    диск, а после монтирования Drive исчезла бы из виду — и всё это с бодрой
+    записью об успехе в логе.
+    """
+    target = BACKUP_DIR.resolve()
+    probe = target
+    while not probe.exists():          # каталогов на Drive может ещё не быть
+        probe = probe.parent
+    # смонтированный fuse — это другое устройство, чем локальный диск
+    return probe.stat().st_dev != QUICK_DIR.stat().st_dev
+
 def _copy_to_drive():
     """Синхронная копия на Drive. Вызывать только из отдельного потока!"""
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,6 +143,10 @@ async def backup_job(context=None):
     global _backup_pending
     if not _backup_pending:
         return
+    if not await asyncio.to_thread(drive_ready):
+        # флаг не снимаем: скопируем, когда Drive появится
+        logger.debug("Drive не смонтирован, копия отложена")
+        return
     _backup_pending = False
     try:
         names = await asyncio.to_thread(_copy_to_drive)
@@ -139,6 +159,9 @@ async def backup_job(context=None):
 
 def restore_from_drive():
     """На чистой машине поднимает прогресс из Drive. Локальные файлы важнее."""
+    if not drive_ready():
+        logger.info("Drive не смонтирован — восстанавливать нечего")
+        return
     for name in ("progress.json", "ptb_state.pickle"):
         local, remote = QUICK_DIR / name, BACKUP_DIR / name
         if not local.exists() and remote.exists():
