@@ -360,6 +360,11 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx на уровне INFO печатает URL целиком — вместе с токеном бота.
+    # В лог это попадать не должно: файл переживает ротацию токена.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
     restore_from_drive()  # на чистой машине поднимаем прогресс из Drive
 
     # update_interval=15 — потолок потерь при жёстком kill; при обычной
