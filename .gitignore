@@ -1,4 +1,5 @@
 tmp/
-03_Telegram_bot/venv
+03_Telegram_bot/logs
 03_Telegram_bot/__pycache__
+03_Telegram_bot/venv
 
