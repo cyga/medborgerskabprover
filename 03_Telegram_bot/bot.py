@@ -10,6 +10,7 @@
 
 Данные: JSON-файлы прошлых экзаменов в ../02_Tidligere_proever/
 Прогресс хранится в progress.json рядом с ботом.
+Незавершённые сессии — в ptb_state.pickle (переживают перезапуск).
 """
 import asyncio
 import json
@@ -20,11 +21,13 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes)
+                          ContextTypes, PicklePersistence)
 
 BASE = Path(__file__).parent
 DATA_DIR = BASE.parent / "02_Tidligere_proever"
 PROGRESS_FILE = BASE / "progress.json"
+# Незавершённые сессии (context.user_data) — переживают перезапуск бота.
+STATE_FILE = BASE / "ptb_state.pickle"
 TOKEN = os.environ.get("BOT_TOKEN") or (BASE / "token.txt").read_text().strip()
 
 QUIZ_LEN = 10
@@ -180,6 +183,14 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s:
         await query.edit_message_reply_markup(None)
         return
+    # Сессия могла быть восстановлена из файла после того, как база вопросов
+    # изменилась — тогда продолжать её нельзя.
+    if s["idx"] >= len(s["ids"]) or s["ids"][s["idx"]] not in QUESTIONS:
+        context.user_data.pop("session", None)
+        await query.edit_message_reply_markup(None)
+        await query.message.reply_text(
+            "⚠️ Старая сессия больше не актуальна. Начни заново: /quiz")
+        return
     qid = s["ids"][s["idx"]]
     q = QUESTIONS[qid]
     chosen = query.data
@@ -226,7 +237,11 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("session", None)
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    # update_interval=15 — потолок потерь при жёстком kill; при обычной
+    # остановке (Ctrl-C / SIGTERM) PTB сбрасывает состояние на диск сам.
+    persistence = PicklePersistence(filepath=STATE_FILE, update_interval=15)
+    app = (Application.builder().token(TOKEN)
+           .persistence(persistence).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("quiz", cmd_quiz))
     app.add_handler(CommandHandler("exam", cmd_exam))
