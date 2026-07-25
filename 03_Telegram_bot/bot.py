@@ -11,6 +11,7 @@
 Данные: JSON-файлы прошлых экзаменов в ../02_Tidligere_proever/
 Прогресс хранится в progress.json рядом с ботом.
 """
+import asyncio
 import json
 import os
 import random
@@ -47,14 +48,27 @@ for f in sorted(DATA_DIR.glob("*.json")):
         QUESTIONS[qid] = q
 
 # ---------- прогресс ----------
+# Файл общий для всех пользователей, а цикл «прочитать → изменить → записать»
+# не атомарен: без блокировки два одновременных ответа затрут друг друга.
+PROGRESS_LOCK = asyncio.Lock()
+
 def load_progress():
     if PROGRESS_FILE.exists():
         return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
     return {}
 
 def save_progress(p):
-    PROGRESS_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=1),
-                             encoding="utf-8")
+    """Атомарная запись: пишем во временный файл и подменяем им основной.
+
+    os.replace на одной ФС атомарен, поэтому при падении/убийстве процесса
+    progress.json остаётся либо старым, либо новым, но не обрезанным.
+    """
+    tmp = PROGRESS_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(p, fh, ensure_ascii=False, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(PROGRESS_FILE)
 
 def user_data(p, uid):
     return p.setdefault(str(uid), {"seen": {}, "wrong": [], "sessions": []})
@@ -170,17 +184,25 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = QUESTIONS[qid]
     chosen = query.data
     ok = chosen == q["correct"]
-
-    p = load_progress()
-    ud = user_data(p, update.effective_user.id)
-    ud["seen"][qid] = {"last_ok": ok}
     if ok:
         s["correct"] += 1
-        if qid in ud["wrong"]:
-            ud["wrong"].remove(qid)
-    else:
-        if qid not in ud["wrong"]:
+    last = s["idx"] + 1 >= len(s["ids"])
+
+    # Весь цикл чтения-изменения-записи держим под одним локом, без await
+    # внутри, чтобы параллельные ответы не потеряли чужой прогресс.
+    async with PROGRESS_LOCK:
+        p = load_progress()
+        ud = user_data(p, update.effective_user.id)
+        ud["seen"][qid] = {"last_ok": ok}
+        if ok:
+            if qid in ud["wrong"]:
+                ud["wrong"].remove(qid)
+        elif qid not in ud["wrong"]:
             ud["wrong"].append(qid)
+        if last:
+            ud["sessions"].append({"mode": s["mode"], "score": s["correct"],
+                                   "total": len(s["ids"])})
+        save_progress(p)
 
     fb = "✅ Rigtigt!" if ok else \
         f"❌ Forkert. Правильно: {q['correct']}: {q['opts'][q['correct']]}"
@@ -189,14 +211,10 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(query.message.text + f"\n\n{fb}")
 
     s["idx"] += 1
-    if s["idx"] < len(s["ids"]):
-        save_progress(p)
+    if not last:
         await send_question(update, context)
     else:
         score, total = s["correct"], len(s["ids"])
-        ud["sessions"].append({"mode": s["mode"], "score": score,
-                               "total": total})
-        save_progress(p)
         if s["mode"] == "exam":
             verdict = ("🎉 BESTÅET! Ты бы сдал." if score >= PASS_SCORE
                        else f"❌ Не хватило {PASS_SCORE - score}. Ещё потренируемся.")
