@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import random
+import unicodedata
 from datetime import time
 from pathlib import Path
 
@@ -50,6 +51,36 @@ for f in sorted(DATA_DIR.glob("*.json")):
         q["ru"] = RU.get(qid, "")
         QUESTIONS[qid] = q
 
+# ---------- группировка дубликатов ----------
+# Одна и та же формулировка встречается в разных экзаменах (275 карточек на
+# ~195 уникальных вопросов), иногда с другими вариантами ответа и другой
+# буквой правильного. Для учёта прогресса это один и тот же факт, поэтому
+# карточки группируются по нормализованному тексту вопроса.
+def _norm(s):
+    s = unicodedata.normalize("NFC", " ".join(s.split())).lower()
+    return "".join(c for c in s if c.isalnum() or c.isspace())
+
+GROUPS = {}    # gid (самый ранний id группы) -> [id, ...]
+GROUP_OF = {}  # id -> gid
+_by_text = {}
+for qid, q in QUESTIONS.items():
+    _by_text.setdefault(_norm(q["q"]), []).append(qid)
+for ids in _by_text.values():
+    gid = sorted(ids)[0]
+    GROUPS[gid] = sorted(ids)
+    for i in ids:
+        GROUP_OF[i] = gid
+
+def group_ids(ids):
+    """Множество групп, к которым относятся карточки ids."""
+    return {GROUP_OF[i] for i in ids if i in GROUP_OF}
+
+def pick_variant(gid, prefer=None):
+    """Случайная формулировка из группы; prefer — если нужна конкретная."""
+    if prefer in GROUPS[gid]:
+        return prefer
+    return random.choice(GROUPS[gid])
+
 # ---------- прогресс ----------
 # Файл общий для всех пользователей, а цикл «прочитать → изменить → записать»
 # не атомарен: без блокировки два одновременных ответа затрут друг друга.
@@ -78,18 +109,36 @@ def user_data(p, uid):
 
 # ---------- выбор вопросов ----------
 def pick_questions(ud, k, exam_mode=False):
-    all_ids = list(QUESTIONS)
+    """Возвращает до k карточек, не более одной из каждой группы дубликатов."""
+    all_gids = list(GROUPS)
     if exam_mode:
-        return random.sample(all_ids, k)
-    unseen = [i for i in all_ids if i not in ud["seen"]]
-    wrong = [i for i in ud["wrong"] if i in QUESTIONS]
-    random.shuffle(unseen)
-    random.shuffle(wrong)
-    picked = wrong[: k // 3] + unseen
-    if len(picked) < k:  # всё видел – добираем случайными
-        rest = [i for i in all_ids if i not in picked]
-        random.shuffle(rest)
-        picked += rest
+        gids = random.sample(all_gids, min(k, len(all_gids)))
+        return [pick_variant(g) for g in gids]
+
+    seen_g = group_ids(ud["seen"])
+    # ошибки переспрашиваем той же формулировкой, на которой споткнулись
+    wrong_pairs, taken = [], set()
+    for i in ud["wrong"]:
+        g = GROUP_OF.get(i)
+        if g and g not in taken:
+            taken.add(g)
+            wrong_pairs.append((g, i))
+    unseen_g = [g for g in all_gids if g not in seen_g]
+    random.shuffle(wrong_pairs)
+    random.shuffle(unseen_g)
+
+    picked, used_g = [], set()
+    for g, qid in wrong_pairs[: k // 3]:
+        picked.append(qid)
+        used_g.add(g)
+    for pool in (unseen_g, all_gids):  # всё видел – добираем остальными
+        random.shuffle(pool)
+        for g in pool:
+            if len(picked) >= k:
+                return picked
+            if g not in used_g:
+                picked.append(pick_variant(g))
+                used_g.add(g)
     return picked[:k]
 
 # ---------- отправка вопроса ----------
@@ -115,7 +164,8 @@ async def start_session(update, context, ids, mode):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🇩🇰 Подготовка к Medborgerskabsprøven\n\n"
-        f"В базе {len(QUESTIONS)} вопросов из реальных экзаменов 2021–2026.\n\n"
+        f"В базе {len(GROUPS)} уникальных вопросов из реальных экзаменов "
+        f"2021–2026 ({len(QUESTIONS)} карточек с учётом повторов).\n\n"
         "/quiz – 10 вопросов (вечерняя норма)\n"
         "/exam – пробный экзамен, 25 вопросов (проходной: 20)\n"
         "/mistakes – работа над ошибками\n"
@@ -140,7 +190,12 @@ async def cmd_exam(update, context):
 async def cmd_mistakes(update, context):
     p = load_progress()
     ud = user_data(p, update.effective_user.id)
-    wrong = [i for i in ud["wrong"] if i in QUESTIONS]
+    wrong, taken = [], set()
+    for i in ud["wrong"]:  # по одной формулировке на факт
+        g = GROUP_OF.get(i)
+        if g and g not in taken:
+            taken.add(g)
+            wrong.append(i)
     if not wrong:
         await update.message.reply_text("🎉 Нет накопленных ошибок!")
         return
@@ -150,12 +205,15 @@ async def cmd_mistakes(update, context):
 async def cmd_stats(update, context):
     p = load_progress()
     ud = user_data(p, update.effective_user.id)
-    seen = len(ud["seen"])
-    correct = sum(1 for v in ud["seen"].values() if v.get("last_ok"))
+    # считаем по уникальным вопросам, а не по карточкам-дубликатам
+    seen_g = group_ids(ud["seen"])
+    wrong_g = group_ids(ud["wrong"])
+    seen = len(seen_g)
+    correct = len(seen_g - wrong_g)
     exams = [s for s in ud["sessions"] if s["mode"] == "exam"]
-    txt = (f"📊 Пройдено вопросов: {seen}/{len(QUESTIONS)}\n"
+    txt = (f"📊 Пройдено вопросов: {seen}/{len(GROUPS)}\n"
            f"Сейчас знаешь: {correct} ({correct * 100 // max(seen, 1)}%)\n"
-           f"В работе над ошибками: {len(ud['wrong'])}\n")
+           f"В работе над ошибками: {len(wrong_g)}\n")
     if exams:
         txt += "\nПробные экзамены:\n" + "\n".join(
             f"  {s['score']}/25 {'✅' if s['score'] >= PASS_SCORE else '❌'}"
@@ -205,10 +263,12 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p = load_progress()
         ud = user_data(p, update.effective_user.id)
         ud["seen"][qid] = {"last_ok": ok}
+        # факт учитывается целиком: ответил верно на любую формулировку —
+        # закрываются все её дубликаты, ошибся — хватает одной записи
+        siblings = set(GROUPS.get(GROUP_OF.get(qid, ""), [qid]))
         if ok:
-            if qid in ud["wrong"]:
-                ud["wrong"].remove(qid)
-        elif qid not in ud["wrong"]:
+            ud["wrong"] = [i for i in ud["wrong"] if i not in siblings]
+        elif not siblings & set(ud["wrong"]):
             ud["wrong"].append(qid)
         if last:
             ud["sessions"].append({"mode": s["mode"], "score": s["correct"],
