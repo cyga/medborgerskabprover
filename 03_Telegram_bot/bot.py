@@ -9,13 +9,16 @@
   /reminder – ежедневное напоминание в 20:00
 
 Данные: JSON-файлы прошлых экзаменов в ../02_Tidligere_proever/
-Прогресс хранится в progress.json рядом с ботом.
-Незавершённые сессии — в ptb_state.pickle (переживают перезапуск).
+Прогресс и незавершённые сессии — в data-quick/ на локальном диске
+(progress.json и ptb_state.pickle), копия раз в минуту уезжает в data/,
+который является симлинком на Google Drive.
 """
 import asyncio
 import json
+import logging
 import os
 import random
+import shutil
 import unicodedata
 from datetime import time
 from pathlib import Path
@@ -26,10 +29,21 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 BASE = Path(__file__).parent
 DATA_DIR = BASE.parent / "02_Tidligere_proever"
-PROGRESS_FILE = BASE / "progress.json"
+# Рабочие данные — на локальном диске: запись должна быть быстрой и атомарной.
+QUICK_DIR = BASE / "data-quick"
+QUICK_DIR.mkdir(parents=True, exist_ok=True)
+PROGRESS_FILE = QUICK_DIR / "progress.json"
 # Незавершённые сессии (context.user_data) — переживают перезапуск бота.
-STATE_FILE = BASE / "ptb_state.pickle"
+STATE_FILE = QUICK_DIR / "ptb_state.pickle"
 TOKEN = os.environ.get("BOT_TOKEN") or (BASE / "token.txt").read_text().strip()
+
+# data/ — симлинк на Google Drive (google-drive-ocamlfuse). Запись туда стоит
+# ~3.6 с против 5 мс на локальном диске, поэтому рабочие файлы остаются
+# локальными, а на Drive уезжает копия — в отдельном потоке, по таймеру.
+BACKUP_DIR = BASE / "data"
+BACKUP_INTERVAL = 60  # секунд между проверками «есть ли что копировать»
+
+logger = logging.getLogger(__name__)
 
 QUIZ_LEN = 10
 EXAM_LEN = 25
@@ -85,11 +99,49 @@ def pick_variant(gid, prefer=None):
 # Файл общий для всех пользователей, а цикл «прочитать → изменить → записать»
 # не атомарен: без блокировки два одновременных ответа затрут друг друга.
 PROGRESS_LOCK = asyncio.Lock()
+_backup_pending = False  # есть ли несохранённые на Drive изменения
 
 def load_progress():
     if PROGRESS_FILE.exists():
         return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
     return {}
+
+def backup_files():
+    return [f for f in (PROGRESS_FILE, STATE_FILE) if f.exists()]
+
+def _copy_to_drive():
+    """Синхронная копия на Drive. Вызывать только из отдельного потока!"""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    names = []
+    for src in backup_files():
+        tmp = BACKUP_DIR / (src.name + ".tmp")
+        shutil.copyfile(src, tmp)
+        tmp.replace(BACKUP_DIR / src.name)
+        names.append(src.name)
+    return names
+
+async def backup_job(context=None):
+    """Копирует локальные файлы на Drive, если с прошлого раза что-то менялось."""
+    global _backup_pending
+    if not _backup_pending:
+        return
+    _backup_pending = False
+    try:
+        names = await asyncio.to_thread(_copy_to_drive)
+        logger.info("на Drive скопировано: %s", ", ".join(names) or "нечего")
+    except OSError as e:
+        # Drive отвалился или размонтирован — бот продолжает работать локально
+        _backup_pending = True
+        logger.warning("копия на Drive не удалась (%s), повтор через %d c",
+                       e, BACKUP_INTERVAL)
+
+def restore_from_drive():
+    """На чистой машине поднимает прогресс из Drive. Локальные файлы важнее."""
+    for name in ("progress.json", "ptb_state.pickle"):
+        local, remote = QUICK_DIR / name, BACKUP_DIR / name
+        if not local.exists() and remote.exists():
+            shutil.copyfile(remote, local)
+            logger.info("восстановлено с Drive: %s", name)
 
 def save_progress(p):
     """Атомарная запись: пишем во временный файл и подменяем им основной.
@@ -97,12 +149,14 @@ def save_progress(p):
     os.replace на одной ФС атомарен, поэтому при падении/убийстве процесса
     progress.json остаётся либо старым, либо новым, но не обрезанным.
     """
+    global _backup_pending
     tmp = PROGRESS_FILE.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(p, fh, ensure_ascii=False, indent=1)
         fh.flush()
         os.fsync(fh.fileno())
     tmp.replace(PROGRESS_FILE)
+    _backup_pending = True  # копию на Drive заберёт фоновый backup_job
 
 def user_data(p, uid):
     return p.setdefault(str(uid), {"seen": {}, "wrong": [], "sessions": []})
@@ -296,12 +350,24 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Готово: {score}/{total} ✅  Завтра ещё /quiz. /stats – прогресс")
         context.user_data.pop("session", None)
 
+async def final_backup(app):
+    """Последняя копия на Drive после того, как PTB сбросил состояние."""
+    global _backup_pending
+    _backup_pending = True
+    await backup_job()
+
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    restore_from_drive()  # на чистой машине поднимаем прогресс из Drive
+
     # update_interval=15 — потолок потерь при жёстком kill; при обычной
     # остановке (Ctrl-C / SIGTERM) PTB сбрасывает состояние на диск сам.
     persistence = PicklePersistence(filepath=STATE_FILE, update_interval=15)
     app = (Application.builder().token(TOKEN)
-           .persistence(persistence).build())
+           .persistence(persistence)
+           .post_shutdown(final_backup).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("quiz", cmd_quiz))
     app.add_handler(CommandHandler("exam", cmd_exam))
@@ -309,7 +375,11 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("reminder", cmd_reminder))
     app.add_handler(CallbackQueryHandler(on_answer))
-    print(f"Бот запущен. Вопросов в базе: {len(QUESTIONS)}")
+    app.job_queue.run_repeating(backup_job, interval=BACKUP_INTERVAL,
+                                first=BACKUP_INTERVAL, name="drive-backup")
+    print(f"Бот запущен. Уникальных вопросов: {len(GROUPS)} "
+          f"({len(QUESTIONS)} карточек). Копия на Drive раз в "
+          f"{BACKUP_INTERVAL} c.")
     app.run_polling()
 
 if __name__ == "__main__":

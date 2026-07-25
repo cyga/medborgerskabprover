@@ -1,4 +1,8 @@
 tmp/
+# боевой токен бота — не место в репозитории
+03_Telegram_bot/token.txt
+# рабочие данные бота (локально) и их копия на Google Drive
+03_Telegram_bot/data-quick/
 03_Telegram_bot/data
 03_Telegram_bot/logs
 03_Telegram_bot/__pycache__
