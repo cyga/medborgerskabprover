@@ -51,11 +51,14 @@ printf '%s' 'ТОКЕН_ОТ_BOTFATHER' > token.txt
 
 ### 3. Сервис
 
+Unit-файл в репозитории — шаблон: systemd требует абсолютных путей, поэтому
+расположение проекта в нём помечено как `__PROJECT_DIR__` и подставляется
+при установке. Запускать из каталога `03_Telegram_bot`:
+
 ```bash
-mkdir -p logs
-# подставляем актуальный путь к проекту в unit-файл
-sed "s|/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot|$PWD|g" \
-    deploy/medborgerskab-bot.service > ~/.config/systemd/user/medborgerskab-bot.service
+mkdir -p logs ~/.config/systemd/user
+sed "s|__PROJECT_DIR__|$PWD|g" deploy/medborgerskab-bot.service \
+    > ~/.config/systemd/user/medborgerskab-bot.service
 
 systemctl --user daemon-reload
 systemctl --user enable --now medborgerskab-bot

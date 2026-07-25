@@ -1,13 +1,15 @@
-# systemd user service для бота.
+# systemd user service для бота — шаблон.
 #
-# Пути ниже указывают на текущее расположение проекта. Если репозиторий
-# лежит в другом месте, поправь их — проще всего командой sed из README
-# (секция INSTALL), она подставит актуальный путь автоматически.
+# systemd требует абсолютных путей, поэтому расположение проекта задаётся
+# плейсхолдером __PROJECT_DIR__ и подставляется при установке:
 #
-# Установка:
-#   cp deploy/medborgerskab-bot.service ~/.config/systemd/user/
+#   cd 03_Telegram_bot
+#   sed "s|__PROJECT_DIR__|$PWD|g" deploy/medborgerskab-bot.service \
+#       > ~/.config/systemd/user/medborgerskab-bot.service
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now medborgerskab-bot
+#
+# Подробности — в README, секция INSTALL.
 
 [Unit]
 Description=Medborgerskabsprøven Telegram bot
@@ -18,13 +20,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot
+WorkingDirectory=__PROJECT_DIR__
 # venv не активируем: прямой вызов его python делает то же самое
-ExecStart=/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot/venv/bin/python -u bot.py
+ExecStart=__PROJECT_DIR__/venv/bin/python -u bot.py
 
 # -u уже в ExecStart, поэтому строки попадают в лог сразу, без буферизации
-StandardOutput=append:/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot/logs/bot.log
-StandardError=append:/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot/logs/bot.log
+StandardOutput=append:__PROJECT_DIR__/logs/bot.log
+StandardError=append:__PROJECT_DIR__/logs/bot.log
 
 Restart=always
 RestartSec=10
