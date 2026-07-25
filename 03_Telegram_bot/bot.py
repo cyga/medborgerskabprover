@@ -6,7 +6,8 @@
   /exam    – пробный экзамен: 25 случайных вопросов, как на настоящем
   /mistakes – повторить свои ошибки
   /stats   – статистика
-  /reminder – ежедневное напоминание в 20:00
+  /reminder – ежедневное напоминание, время по Копенгагену
+              (кнопки, либо /reminder 21:15, либо /reminder off)
 
 Данные: JSON-файлы прошлых экзаменов в ../02_Tidligere_proever/
 Прогресс и незавершённые сессии — в data-quick/ на локальном диске
@@ -18,10 +19,12 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import unicodedata
 from datetime import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden
@@ -49,7 +52,12 @@ logger = logging.getLogger(__name__)
 QUIZ_LEN = 10
 EXAM_LEN = 25
 PASS_SCORE = 20
-REMINDER_TIME = time(hour=20, minute=0)  # время сервера
+# Планировщик PTB работает в UTC, и наивное time(20, 0) он трактует как UTC —
+# напоминание приходило в 22:00 по Копенгагену. Время должно быть с tzinfo;
+# ZoneInfo сам учитывает переход на зимнее время.
+TZ = ZoneInfo("Europe/Copenhagen")
+DEFAULT_REMINDER = "20:00"
+PRESET_TIMES = ("18:00", "19:00", "20:00", "21:00", "22:00")
 
 # ---------- загрузка вопросов ----------
 QUESTIONS = {}  # id -> question dict
@@ -249,7 +257,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/exam – пробный экзамен, 25 вопросов (проходной: 20)\n"
         "/mistakes – работа над ошибками\n"
         "/stats – статистика\n"
-        "/reminder – напоминание каждый вечер в 20:00")
+        "/reminder – ежедневное напоминание: кнопки или /reminder 21:15")
 
 async def cmd_quiz(update, context):
     p = load_progress()
@@ -299,28 +307,99 @@ async def cmd_stats(update, context):
             for s in exams[-5:])
     await update.message.reply_text(txt)
 
-def schedule_reminder(job_queue, chat_id):
+def reminders_of(bot_data):
+    """Словарь {chat_id: 'ЧЧ:ММ'}. Заодно мигрирует старый формат (set)."""
+    r = bot_data.get("reminders")
+    if isinstance(r, set):  # раньше хранились только chat_id, время было 20:00
+        r = {c: DEFAULT_REMINDER for c in r}
+        bot_data["reminders"] = r
+    elif r is None:
+        r = bot_data["reminders"] = {}
+    return r
+
+def parse_hhmm(text):
+    """'21:30', '21.30', '9', '0900' -> '21:30' | None, если не разобрали."""
+    m = re.fullmatch(r"(\d{1,2})(?:[:.\s]?(\d{2}))?", text.strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    return f"{h:02d}:{mi:02d}" if h < 24 and mi < 60 else None
+
+def schedule_reminder(job_queue, chat_id, hhmm):
     """Ставит (или переставляет) ежедневное напоминание для чата."""
     for j in job_queue.get_jobs_by_name(str(chat_id)):
         j.schedule_removal()
-    job_queue.run_daily(reminder_job, REMINDER_TIME,
+    h, mi = (int(x) for x in hhmm.split(":"))
+    job_queue.run_daily(reminder_job, time(hour=h, minute=mi, tzinfo=TZ),
                         chat_id=chat_id, name=str(chat_id))
+
+def cancel_reminder(job_queue, chat_id):
+    for j in job_queue.get_jobs_by_name(str(chat_id)):
+        j.schedule_removal()
+
+def reminder_keyboard(current=None):
+    btns = [InlineKeyboardButton(("✅ " if t == current else "") + t,
+                                 callback_data=f"rem:{t}") for t in PRESET_TIMES]
+    return InlineKeyboardMarkup(
+        [btns[:3], btns[3:],
+         [InlineKeyboardButton("🔕 выключить", callback_data="rem:off")]])
+
+def set_reminder(context, chat_id, hhmm):
+    """Ставит напоминание и запоминает его в bot_data (он персистится)."""
+    schedule_reminder(context.job_queue, chat_id, hhmm)
+    reminders_of(context.bot_data)[chat_id] = hhmm
 
 async def cmd_reminder(update, context):
     chat_id = update.effective_chat.id
-    schedule_reminder(context.job_queue, chat_id)
-    # JobQueue не персистится, поэтому список чатов храним сами — в bot_data,
-    # который PicklePersistence сохраняет и поднимает при старте.
-    context.bot_data.setdefault("reminders", set()).add(chat_id)
+    rem = reminders_of(context.bot_data)
+    arg = " ".join(context.args).strip() if context.args else ""
+
+    if not arg:  # без аргумента — показываем кнопки
+        now = rem.get(chat_id)
+        await update.message.reply_text(
+            (f"⏰ Сейчас напоминаю в {now}." if now
+             else "⏰ Напоминание пока не включено.")
+            + "\n\nВыбери время или задай своё: /reminder 21:15",
+            reply_markup=reminder_keyboard(now))
+        return
+
+    if arg.lower() in ("off", "выкл", "выключить", "стоп"):
+        cancel_reminder(context.job_queue, chat_id)
+        rem.pop(chat_id, None)
+        await update.message.reply_text("🔕 Напоминания выключены.")
+        return
+
+    hhmm = parse_hhmm(arg)
+    if not hhmm:
+        await update.message.reply_text(
+            "Не понял время. Примеры: /reminder 21:15, /reminder 9, "
+            "/reminder off")
+        return
+    set_reminder(context, chat_id, hhmm)
     await update.message.reply_text(
-        "⏰ Буду напоминать каждый день в 20:00 (время сервера). /quiz!")
+        f"⏰ Буду напоминать каждый день в {hhmm} по Копенгагену. /quiz!")
+
+async def on_reminder_choice(update, context):
+    """Нажатие на кнопку выбора времени."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    chat_id = update.effective_chat.id
+    if choice == "off":
+        cancel_reminder(context.job_queue, chat_id)
+        reminders_of(context.bot_data).pop(chat_id, None)
+        await query.edit_message_text("🔕 Напоминания выключены.")
+        return
+    set_reminder(context, chat_id, choice)
+    await query.edit_message_text(
+        f"⏰ Буду напоминать каждый день в {choice} по Копенгагену. /quiz!")
 
 async def restore_reminders(app):
     """Перерегистрирует напоминания после перезапуска бота."""
-    chats = sorted(app.bot_data.get("reminders", set()))
-    for chat_id in chats:
-        schedule_reminder(app.job_queue, chat_id)
-    logger.info("восстановлено напоминаний: %d", len(chats))
+    rem = reminders_of(app.bot_data)
+    for chat_id, hhmm in sorted(rem.items()):
+        schedule_reminder(app.job_queue, chat_id, hhmm)
+    logger.info("восстановлено напоминаний: %d", len(rem))
 
 async def reminder_job(context):
     chat_id = context.job.chat_id
@@ -329,7 +408,7 @@ async def reminder_job(context):
             chat_id, "🇩🇰 Время вечерней тренировки! /quiz")
     except Forbidden:
         # бота заблокировали или чат удалён — снимаем напоминание насовсем
-        context.bot_data.get("reminders", set()).discard(chat_id)
+        reminders_of(context.bot_data).pop(chat_id, None)
         context.job.schedule_removal()
         logger.info("напоминание снято: чат %s недоступен", chat_id)
 
@@ -426,7 +505,9 @@ def main():
     app.add_handler(CommandHandler("mistakes", cmd_mistakes))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("reminder", cmd_reminder))
-    app.add_handler(CallbackQueryHandler(on_answer))
+    # порядок важен: кнопки времени и буквы ответов ходят одним типом апдейта
+    app.add_handler(CallbackQueryHandler(on_reminder_choice, pattern=r"^rem:"))
+    app.add_handler(CallbackQueryHandler(on_answer, pattern=r"^[A-Z]$"))
     app.job_queue.run_repeating(backup_job, interval=BACKUP_INTERVAL,
                                 first=BACKUP_INTERVAL, name="drive-backup")
     print(f"Бот запущен. Уникальных вопросов: {len(GROUPS)} "
