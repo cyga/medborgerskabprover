@@ -24,6 +24,7 @@ from datetime import time
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, PicklePersistence)
 
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 QUIZ_LEN = 10
 EXAM_LEN = 25
 PASS_SCORE = 20
+REMINDER_TIME = time(hour=20, minute=0)  # время сервера
 
 # ---------- загрузка вопросов ----------
 QUESTIONS = {}  # id -> question dict
@@ -274,18 +276,39 @@ async def cmd_stats(update, context):
             for s in exams[-5:])
     await update.message.reply_text(txt)
 
+def schedule_reminder(job_queue, chat_id):
+    """Ставит (или переставляет) ежедневное напоминание для чата."""
+    for j in job_queue.get_jobs_by_name(str(chat_id)):
+        j.schedule_removal()
+    job_queue.run_daily(reminder_job, REMINDER_TIME,
+                        chat_id=chat_id, name=str(chat_id))
+
 async def cmd_reminder(update, context):
     chat_id = update.effective_chat.id
-    for j in context.job_queue.get_jobs_by_name(str(chat_id)):
-        j.schedule_removal()
-    context.job_queue.run_daily(reminder_job, time(hour=20, minute=0),
-                                chat_id=chat_id, name=str(chat_id))
+    schedule_reminder(context.job_queue, chat_id)
+    # JobQueue не персистится, поэтому список чатов храним сами — в bot_data,
+    # который PicklePersistence сохраняет и поднимает при старте.
+    context.bot_data.setdefault("reminders", set()).add(chat_id)
     await update.message.reply_text(
         "⏰ Буду напоминать каждый день в 20:00 (время сервера). /quiz!")
 
+async def restore_reminders(app):
+    """Перерегистрирует напоминания после перезапуска бота."""
+    chats = sorted(app.bot_data.get("reminders", set()))
+    for chat_id in chats:
+        schedule_reminder(app.job_queue, chat_id)
+    logger.info("восстановлено напоминаний: %d", len(chats))
+
 async def reminder_job(context):
-    await context.bot.send_message(
-        context.job.chat_id, "🇩🇰 Время вечерней тренировки! /quiz")
+    chat_id = context.job.chat_id
+    try:
+        await context.bot.send_message(
+            chat_id, "🇩🇰 Время вечерней тренировки! /quiz")
+    except Forbidden:
+        # бота заблокировали или чат удалён — снимаем напоминание насовсем
+        context.bot_data.get("reminders", set()).discard(chat_id)
+        context.job.schedule_removal()
+        logger.info("напоминание снято: чат %s недоступен", chat_id)
 
 # ---------- обработка ответов ----------
 async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,6 +395,7 @@ def main():
     persistence = PicklePersistence(filepath=STATE_FILE, update_interval=15)
     app = (Application.builder().token(TOKEN)
            .persistence(persistence)
+           .post_init(restore_reminders)   # после загрузки bot_data
            .post_shutdown(final_backup).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("quiz", cmd_quiz))
