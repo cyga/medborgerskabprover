@@ -1,0 +1,37 @@
+# systemd user service для бота.
+#
+# Пути ниже указывают на текущее расположение проекта. Если репозиторий
+# лежит в другом месте, поправь их — проще всего командой sed из README
+# (секция INSTALL), она подставит актуальный путь автоматически.
+#
+# Установка:
+#   cp deploy/medborgerskab-bot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now medborgerskab-bot
+
+[Unit]
+Description=Medborgerskabsprøven Telegram bot
+Documentation=https://github.com/cyga/medborgerskabprover
+# боту нужна сеть; Google Drive не обязателен — без него он работает локально
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot
+# venv не активируем: прямой вызов его python делает то же самое
+ExecStart=/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot/venv/bin/python -u bot.py
+
+# -u уже в ExecStart, поэтому строки попадают в лог сразу, без буферизации
+StandardOutput=append:/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot/logs/bot.log
+StandardError=append:/home/cyga/Documents/Danish/medborgerskabprøver/03_Telegram_bot/logs/bot.log
+
+Restart=always
+RestartSec=10
+# SIGTERM бот ловит сам: сбрасывает сессии и копию на Google Drive.
+# Копия на Drive занимает ~7 с, поэтому даём время завершиться.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
